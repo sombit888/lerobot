@@ -73,6 +73,7 @@ import rerun as rr
 import torch
 import torch.utils.data
 import tqdm
+from scipy.spatial.transform import Rotation as R
 
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
@@ -97,8 +98,33 @@ def to_hwc_uint8_numpy(chw_float32_torch: torch.Tensor) -> np.ndarray:
     assert c < h and c < w, f"expect channel first images, but instead {chw_float32_torch.shape}"
     hwc_uint8_numpy = (chw_float32_torch * 255).type(torch.uint8).permute(1, 2, 0).numpy()
     return hwc_uint8_numpy
+def rotmat_from_euler(euler_angles):
+    """
+    Convert euler angles to rotation matrix.
+    Args:
+        euler_angles: [roll, pitch, yaw]
+    Returns:
+        Rotation matrix
+    """
+    r = R.from_euler('xyz', euler_angles, degrees=False)
+    return r.as_matrix() 
 
+def rotate_vector(vector, rotation_matrix):
+    vector = np.array(vector)
+    return np.dot(rotation_matrix, vector)
 
+def incremental_to_global(points_list,rotation_list,):
+    points_global = []
+    points_global.append(points_list[0])
+    for i in range(1,len(points_list)):
+        prev = points_global[-1]
+        rotmat = np.array(rotation_list[i]).reshape(3,3)
+        # curr = [a + b for a, b in zip(prev, points_list[i])] this is wrong, we need to add the rotation to the points
+        # curr = [a + rotate_vector(b,rotmat_from_euler(c)) for a, b in zip(prev, points_list[i] s)]
+        # curr = prev + rotate_vector(points_list[i],rotmat_from_euler(rotation_list[i]))
+        curr = prev + rotate_vector(points_list[i],rotmat)
+        points_global.append(curr)
+    return points_global
 def visualize_dataset(
     repo_id: str,
     episode_index: int,
@@ -117,8 +143,8 @@ def visualize_dataset(
         ), "Set an output directory where to write .rrd files with `--output-dir path/to/directory`."
 
     logging.info("Loading dataset")
-    dataset = LeRobotDataset(repo_id, root=root)
-
+    # dataset = LeRobotDataset(repo_id, root=root)
+    dataset = LeRobotDataset("work2-gcp-europe-west4-a/nikolay_nikolov/datasets/oxe/lerobot/fractal20220817_data",root='/data/')
     logging.info("Loading dataloader")
     episode_sampler = EpisodeSampler(dataset, episode_index)
     dataloader = torch.utils.data.DataLoader(
@@ -134,6 +160,7 @@ def visualize_dataset(
         raise ValueError(mode)
 
     spawn_local_viewer = mode == "local" and not save
+    
     rr.init(f"{repo_id}/episode_{episode_index}", spawn=spawn_local_viewer)
 
     # Manually call python garbage collector after `rr.init` to avoid hanging in a blocking flush
@@ -145,10 +172,12 @@ def visualize_dataset(
         rr.serve(open_browser=False, web_port=web_port, ws_port=ws_port)
 
     logging.info("Logging to Rerun")
-
+    points_global = []
+    vector_global = []
     for batch in tqdm.tqdm(dataloader, total=len(dataloader)):
         # iterate over the batch
         for i in range(len(batch["index"])):
+        # for i in range(:
             rr.set_time_sequence("frame_index", batch["frame_index"][i].item())
             rr.set_time_seconds("timestamp", batch["timestamp"][i].item())
 
@@ -156,13 +185,57 @@ def visualize_dataset(
             for key in dataset.camera_keys:
                 # TODO(rcadene): add `.compress()`? is it lossless?
                 rr.log(key, rr.Image(to_hwc_uint8_numpy(batch[key][i])))
-
+        
             # display each dimension of action space (e.g. actuators command)
-            if "action" in batch:
-                for dim_idx, val in enumerate(batch["action"][i]):
-                    rr.log(f"action/{dim_idx}", rr.Scalar(val.item()))
-
+            
+            # if "action" in batch:
+            #     points_local =[]
+            #     rot_local = []
+            #     for dim_idx, val in enumerate(batch["action"][i]):
+            #         rr.log(f"action/{dim_idx}", rr.Scalar(val.item()))
+            #         if dim_idx<3:
+            #             points_local.append(val.item())
+            #         elif dim_idx<6:
+            #             rot_local.append(val.item())
+                
+            #     points_global.append(points_local)
+            #     rr.log("trajectory/points", rr.Points3D(points_global))
             # display each dimension of observed state space (e.g. agent position in joint space)
+            #if 'control.translation' in batch:
+            #    points_local = []
+            #    for dim_idx,val in enumerate(batch["control.translation"][i]):
+            #       if dim_idx <3 : 
+            #            points_local.append(val.item())
+            #    points_global.append(points_local)
+            #    rr.log('trajectory/points_3d',rr.Points3D(points_global,radii=0.02))
+            
+            if 'control.translation' in batch:
+                points_local = []
+                for dim_idx,val in enumerate(batch["control.translation"][i]):
+                    if dim_idx <3 : 
+                        points_local.append(val.item())
+            if 'control.rotation' in batch:
+
+                rotation_local = []
+                for dim_idx,val in enumerate(batch["control.rotation"][i]):
+                    if dim_idx <3 : 
+                        rotation_local.append(val.item())
+                 
+            # print(points_local,rotation_local)            
+            # # if not len(points_global):
+            # points_global.append(points_local)
+            # import pdb; pdb.set_trace()
+            if not len(points_global):
+                points_global.append(points_local)
+            else:
+                x = points_global[-1] + rotate_vector(points_local,rotmat_from_euler(rotation_local))
+                points_global.append(list(x))
+            # point_global = incremental_to_global(points_local,rotation_local)
+            # else: 
+            #     prev = points_global[-1]
+            #     curr = [a + b for a, b in zip(prev, points_local)]
+            #     points_global.append(curr)
+            rr.log('trajectory/points_3d',rr.Points3D(points_global,radii=0.02))
             if "observation.state" in batch:
                 for dim_idx, val in enumerate(batch["observation.state"][i]):
                     rr.log(f"state/{dim_idx}", rr.Scalar(val.item()))
